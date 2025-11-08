@@ -1,27 +1,27 @@
 using System.ClientModel;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using Microsoft.Extensions.AI;
-using OpenAI;
+using Microsoft.Agents.AI;
 using ContosoBikeReviewAnalyzer.Models;
+using OpenAI;
 
 namespace ContosoBikeReviewAnalyzer.Services;
 
 /// <summary>
-/// Service class for analyzing customer bike reviews using AI agents
+/// Service class for analyzing customer bike reviews using Microsoft Agent Framework
 /// </summary>
 public class ReviewAnalyzerService
 {
-    private readonly IChatClient _chatClient;
-    private readonly ChatOptions _chatOptions;
-    private readonly string _systemPrompt;
+    private readonly AIAgent _agent;
 
-    public ReviewAnalyzerService(string apiKey, string modelId = "gpt-4.1-mini")
+    public ReviewAnalyzerService(string uri, string apiKey, string modelId = "gpt-4o")
     {
         // Generate JSON schema from ReviewAnalysis type
         JsonElement schema = AIJsonUtilities.CreateJsonSchema(typeof(ReviewAnalysis));
 
         // Configure chat options for structured output
-        _chatOptions = new()
+        ChatOptions chatOptions = new()
         {
             ResponseFormat = ChatResponseFormat.ForJsonSchema(
                 schema: schema,
@@ -29,17 +29,14 @@ public class ReviewAnalyzerService
                 schemaDescription: "Structured analysis of customer bike reviews for Contoso Bike Store")
         };
 
-        // Create the chat client - cast to IChatClient interface
-        var openAIClient = new OpenAIClient(
-                new ApiKeyCredential(apiKey),
-                new OpenAIClientOptions
-                {
-                    Endpoint = new Uri("https://models.github.ai/inference")
-                });
-        var chatClient = openAIClient.GetChatClient(modelId);
-        _chatClient = (IChatClient)chatClient;
+        var client = new OpenAIClient(new ApiKeyCredential(apiKey), new OpenAIClientOptions { Endpoint = new Uri(uri) });
+        var chatCompletionClient = client.GetChatClient(modelId);
 
-        _systemPrompt = @"You are a customer review analyzer for Contoso Bike Store.
+        _agent = chatCompletionClient.CreateAIAgent(new ChatClientAgentOptions()
+        {
+            Name = "ContosoBikeReviewAnalyzer",
+            ChatOptions = chatOptions,
+            Instructions = @"You are a customer review analyzer for Contoso Bike Store.
             Your role is to analyze customer reviews and extract insights.
 
             ANALYSIS GUIDELINES:
@@ -50,16 +47,10 @@ public class ReviewAnalyzerService
             - Provide a concise summary of the review's key points
             - If information is not mentioned, leave fields as null rather than guessing
             
-            IMPORTANT: Always respond with valid JSON that matches the ReviewAnalysis schema exactly.";
+            IMPORTANT: Always respond with valid JSON that matches the ReviewAnalysis schema exactly.",
+        });
     }
 
-    /// <summary>
-    /// Analyzes a customer review and returns structured insights
-    /// </summary>
-    /// <param name="reviewText">The customer review text to analyze</param>
-    /// <returns>Structured analysis of the review</returns>
-    /// <exception cref="JsonException">Thrown when the agent response cannot be parsed</exception>
-    /// <exception cref="ArgumentException">Thrown when review text is null or empty</exception>
     public async Task<ReviewAnalysis> AnalyzeReviewAsync(string reviewText)
     {
         if (string.IsNullOrWhiteSpace(reviewText))
@@ -69,21 +60,15 @@ public class ReviewAnalyzerService
 
         try
         {
-            var messages = new List<ChatMessage>
+            var response = await _agent.RunAsync($"Please analyze this customer review: {reviewText}");
+            var jsonOptions = new JsonSerializerOptions
             {
-                new(ChatRole.System, _systemPrompt),
-                new(ChatRole.User, $"Please analyze this customer review: {reviewText}")
+                PropertyNameCaseInsensitive = true,
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                TypeInfoResolver = new DefaultJsonTypeInfoResolver()
             };
 
-            var response = await _chatClient.CompleteAsync(messages, _chatOptions);
-            var responseText = response.Message.Text;
-
-            if (string.IsNullOrEmpty(responseText))
-            {
-                throw new InvalidOperationException("Received empty response from AI model");
-            }
-
-            var analysis = JsonSerializer.Deserialize<ReviewAnalysis>(responseText, JsonSerializerOptions.Web);
+            var analysis = response.Deserialize<ReviewAnalysis>(jsonOptions);
             return analysis ?? throw new JsonException("Failed to deserialize agent response to ReviewAnalysis");
         }
         catch (JsonException)
